@@ -1,0 +1,15 @@
+/build
+/logs
+/Thirparty/ORB_SLAM2/Examples/Monocular/mono_euroc
+/Thirparty/ORB_SLAM2/Examples/Monocular/mono_kitti
+/Thirparty/ORB_SLAM2/Examples/Monocular/mono_tum
+/Thirparty/ORB_SLAM2/Examples/RGB-D/rgbd_tum
+/Thirparty/ORB_SLAM2/Examples/Stereo/stereo_euroc
+/Thirparty/ORB_SLAM2/Examples/Stereo/stereo_kitti
+/Thirparty/ORB_SLAM2/Thirdparty/DBoW2/build
+/Thirparty/ORB_SLAM2/Thirdparty/DBoW2/lib
+/Thirparty/ORB_SLAM2/Thirdparty/g2o/build
+/Thirparty/ORB_SLAM2/Thirdparty/g2o/config.h
+/Thirparty/ORB_SLAM2/Thirdparty/g2o/lib
+/Thirparty/ORB_SLAM2/Vocabulary/ORBvoc.txt
+/Thirparty/ORB_SLAM2/build
