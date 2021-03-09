@@ -3,6 +3,8 @@ Implementation of "An Analytical Solution to the IMU Initialization Problem for 
 
 **Authors:** [David Zuñiga-Noël](http://mapir.isa.uma.es/dzuniga), [Francisco-Angel Moreno](http://mapir.uma.es/mapirwebsite/index.php/people/199-francisco-moreno-due%C3%B1as) and [Javier Gonzalez-Jimenez](http://mapir.uma.es/mapirwebsite/index.php/people/95-javier-gonzalez-jimenez)
 
+Draft: [arXiv:2103.03389](https://arxiv.org/abs/2103.03389)
+
 ## Dependencies (tested)
 * CMake (3.10.2):
    ```
