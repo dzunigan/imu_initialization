@@ -288,7 +288,7 @@ void run(const fs::path &sequence_path) {
 
         {
           ResultType proposed_result;
-          proposed_noweight(input, proposed_result);
+          proposed_accelerometer(input, proposed_result);
 
           if (proposed_result.success) {
             const double scale_error = 100.*std::abs(proposed_result.scale - 1.);
