@@ -59,23 +59,17 @@ struct result_t {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
   bool success;
-  std::int64_t solve_ns;
+  std::int64_t solve_ns, velocities_ns;
   double scale;
   Eigen::Vector3d bias_g, bias_a, gravity;
-  
-  // For analysis
-  Eigen::Vector3d svA_;
-  double detA_;
-  //Eigen::Vector3d svS;
-  //double detS;
 };
 
 using InputType = std::vector<input_t>;
 using ResultType = result_t;
 
-void proposed_gyroscope(const InputType &input,
-                        ResultType &result,
-                        const Eigen::Matrix3d &Rcb = Eigen::Matrix3d::Identity()) {
+void gyroscope_only(const InputType &input,
+                    ResultType &result,
+                    const Eigen::Matrix3d &Rcb = Eigen::Matrix3d::Identity(), bool use_covarinace = true) {
   double** parameters = new double*[1];
   parameters[0] = new double[3];
   Eigen::Map<Eigen::Vector3d> bias_(parameters[0]);
@@ -87,7 +81,7 @@ void proposed_gyroscope(const InputType &input,
     const Eigen::Isometry3d &T2 = input[i].T2;
     const std::shared_ptr<IMU::Preintegrated> pInt = input[i].pInt;
 
-    ceres::CostFunction* cost_function = new GyroscopeBiasCostFunction(pInt, T1.linear()*Rcb, T2.linear()*Rcb);
+    ceres::CostFunction* cost_function = new GyroscopeBiasCostFunction(pInt, T1.linear()*Rcb, T2.linear()*Rcb, use_covarinace);
     problem.AddResidualBlock(cost_function, nullptr, parameters, 1);
   }
 
@@ -130,11 +124,14 @@ Eigen::VectorXd real_roots(const Eigen::VectorXd &real, const Eigen::VectorXd &i
 	return roots;
 }
 
-void proposed_accelerometer(const InputType &input, ResultType &result,
+void analytic_accelerometer(const InputType &input, ResultType &result,
                             const Eigen::Vector3d &bg = Eigen::Vector3d::Zero(),
                             const Eigen::Vector3d &ba = Eigen::Vector3d::Zero(),
-                            const Eigen::Isometry3d &Tcb = Eigen::Isometry3d::Identity()) {
-  LOG(INFO) << "Running proposed method at " << input[0].t1;
+                            const Eigen::Isometry3d &Tcb = Eigen::Isometry3d::Identity(),
+                            const double prior = 0.0) {
+  //LOG(INFO) << "Running proposed method at " << input[0].t1;
+
+  CHECK_GE(prior, 0.0);
 
   constexpr int n = 7;
   constexpr int q = 4;
@@ -149,6 +146,25 @@ void proposed_accelerometer(const InputType &input, ResultType &result,
   
   Timer timer;
   timer.Start();
+
+  const Eigen::Vector3d ba_prior_mean = Eigen::Vector3d::Zero();
+  
+  // accelerometer bias prior
+  {    
+    Eigen::MatrixXd M_k(3, n);
+    M_k.setZero();
+    
+    M_k.block<3, 3>(0, 1) = Eigen::Matrix3d::Identity();
+    
+    Eigen::Vector3d pi_k;
+    pi_k = ba_prior_mean;
+    
+    Eigen::Matrix3d Information = prior*Eigen::Matrix3d::Identity();
+
+    M +=  M_k.transpose()*Information*M_k;
+    m += -2.*M_k.transpose()*Information*pi_k;
+    Q +=  pi_k.transpose()*Information*pi_k;
+  }
 
   for (unsigned i = 1; i < input.size(); ++i) {
     //CHECK_EQ(input[i-1].t2, input[i].t1);
@@ -174,8 +190,8 @@ void proposed_accelerometer(const InputType &input, ResultType &result,
 
     Eigen::Vector3d pi_k;
     pi_k = B*pInt23.GetDeltaPosition(bg, ba) - A*pInt12.GetDeltaPosition(bg, ba) + R1*pInt12.GetDeltaVelocity(bg, ba)
-            + (T2.linear()-T1.linear())*Tcb.translation()/pInt12.dT
-            - (T3.linear()-T2.linear())*Tcb.translation()/pInt23.dT;
+            + (T2.linear() - T1.linear())*Tcb.translation()/pInt12.dT
+            - (T3.linear() - T2.linear())*Tcb.translation()/pInt23.dT;
 
     Eigen::Matrix3d Covariance;
     Covariance  = A*pInt12.C.block<3, 3>(6, 6)*A.transpose();
@@ -195,10 +211,10 @@ void proposed_accelerometer(const InputType &input, ResultType &result,
   //LOG(INFO) << StringPrintf("A: %.16f", A);
   
   // TODO Check if A is invertible!!
-  Eigen::Matrix3d A_ = A.block<3, 3>(1, 1);
-  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> svdA_(A_, Eigen::EigenvaluesOnly);
-  result.svA_ = svdA_.eigenvalues();
-  result.detA_ = A_.determinant();
+  //Eigen::Matrix3d A_ = A.block<3, 3>(1, 1);
+  //Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> svdA_(A_, Eigen::EigenvaluesOnly);
+  //result.svA_ = svdA_.eigenvalues();
+  //result.detA_ = A_.determinant();
 
   Eigen::MatrixXd Bt = 2.*M.block<3, 4>(q, 0);
   Eigen::MatrixXd BtAi = Bt*A.inverse();
@@ -312,23 +328,52 @@ void proposed_accelerometer(const InputType &input, ResultType &result,
   const double constraint = solution.transpose()*W*solution;
   if (solution[0] < 1e-3 || constraint < 0.
       || std::abs(std::sqrt(constraint) - IMU::GRAVITY_MAGNITUDE)/IMU::GRAVITY_MAGNITUDE > 1e-3) { // TODO
-    LOG(INFO) << "Discarding bad solution...\n"
-              << StringPrintf("scale: %.16f\n", solution[0])
-              << StringPrintf("constraint: %.16f\n", constraint)
-              << StringPrintf("constraint error: %.2f %", 100.*std::abs(std::sqrt(constraint) - IMU::GRAVITY_MAGNITUDE)/IMU::GRAVITY_MAGNITUDE);
+    LOG(WARNING) << "Discarding bad solution...\n"
+                 << StringPrintf("scale: %.16f\n", solution[0])
+                 << StringPrintf("constraint: %.16f\n", constraint)
+                 << StringPrintf("constraint error: %.2f %", 100.*std::abs(std::sqrt(constraint) - IMU::GRAVITY_MAGNITUDE)/IMU::GRAVITY_MAGNITUDE);
     result.success = false;
     return;
   }
-
+  
   result.success = true;
   result.scale = solution[0];
   result.bias_a = solution.segment<3>(1);
   result.gravity = solution.segment<3>(4);
+  
+  const int N = input.size() + 1;
+  Eigen::VectorXd velocities(3*N);
+  
+  timer.Start();
+  
+  // Recover velocities
+  for (unsigned int i = 0; i < input.size(); ++i) {
+    const Eigen::Isometry3d &T1 = input[i].T1;
+    const Eigen::Isometry3d &T2 = input[i].T2;
+    const IMU::Preintegrated &pInt12 = *(input[i].pInt);
+    
+    // -[(g*dt12^2)/2 + R1*dP12 + R1_c*pcb - R2_c*pcb + p1_c*s - p2_c*s]/dt12
+    velocities.segment<3>(3*i) = (-0.5*result.gravity*std::pow(pInt12.dT, 2)
+                                  - T1.linear()*Tcb.linear()*pInt12.GetDeltaPosition(bg, result.bias_a)
+                                  - (T1.linear() - T2.linear())*Tcb.translation()
+                                  - (T1.translation() - T2.translation())*result.scale)/pInt12.dT;
+  }
+  
+  // Lask keyframe velocity
+  {
+    const Eigen::Isometry3d &T1 = input.back().T2;
+    const IMU::Preintegrated &pInt12 = *(input.back().pInt);
+    
+    velocities.tail<3>() = velocities.segment<3>(3*(N-2)) + result.gravity*pInt12.dT
+                           + T1.linear()*Tcb.linear()*pInt12.GetDeltaVelocity(bg, result.bias_a);
+  }
+  
+  result.velocities_ns = timer.ElapsedNanoSeconds();
 }
 
 void iterative(const InputType &input, ResultType &result, const double initial_scale = 1.,
                const Eigen::Isometry3d &Tcb = Eigen::Isometry3d::Identity(),
-               double *cost = nullptr, bool use_prior = true, double prior = 1e5) {
+               double *cost = nullptr, double prior = 1e5) {
   std::vector<double*> pointers;
   std::vector<double**> pointers2;
 
@@ -410,10 +455,8 @@ void iterative(const InputType &input, ResultType &result, const double initial_
     parameters = parameters_;
   }
   
-  if (use_prior) {
-    ceres::CostFunction* prior_cost_function = new BiasPriorCostFunction(prior);
-    problem.AddResidualBlock(prior_cost_function, nullptr, ba_ptr);
-  }
+  ceres::CostFunction* prior_cost_function = new BiasPriorCostFunction(prior);
+  problem.AddResidualBlock(prior_cost_function, nullptr, ba_ptr);
 
   // Initialize Rwg estimate
   dirG = dirG.normalized();
@@ -439,12 +482,11 @@ void iterative(const InputType &input, ResultType &result, const double initial_
   
   ceres::Solve(options, &problem, &summary);
 
-  timer.Pause();
+  result.solve_ns = timer.ElapsedNanoSeconds();
 
   bool converged = (summary.termination_type == ceres::CONVERGENCE);
   if (converged) {
     result.success = true;
-    result.solve_ns = timer.ElapsedNanoSeconds();
     result.scale = s_ptr[0];
     result.bias_g = bg;
     result.bias_a = ba;
@@ -453,7 +495,6 @@ void iterative(const InputType &input, ResultType &result, const double initial_
     if (cost) *cost = summary.final_cost;
   } else {
     result.success = false;
-    result.solve_ns = timer.ElapsedNanoSeconds();
   }
 
   // Free memory
@@ -461,6 +502,294 @@ void iterative(const InputType &input, ResultType &result, const double initial_
     delete[] ptr;
   for (double** ptr : pointers2)
     delete[] ptr;
+}
+
+void mqh_accelerometer(const InputType &input, ResultType &result,
+                       const Eigen::Vector3d &bg = Eigen::Vector3d::Zero(),
+                       const Eigen::Isometry3d &Tcb = Eigen::Isometry3d::Identity()) {
+
+  // L. Huang, S. Pan, S. Wang, P. Zeng and F. Ye, "A fast initialization method of Visual-Inertial Odometry
+  //  based on monocular camera," 2018 Ubiquitous Positioning, Indoor Navigation and Location-Based Services
+  //  (UPINLBS), 2018, pp. 1-5, doi: 10.1109/UPINLBS.2018.8559929.
+  
+  double scale;
+  
+  Eigen::Vector3d ba;
+  ba.setZero();
+  
+  Eigen::Vector3d gravity;
+  
+  // Gravity Approximation
+  // ---------------------
+  
+  // R. Mur-Artal and J. D. Tardós, "Visual-Inertial Monocular SLAM With Map Reuse,"
+  //  in IEEE Robotics and Automation Letters, vol. 2, no. 2, pp. 796-803, April 2017,
+  //  doi: 10.1109/LRA.2017.2653359.
+  
+  const int N = input.size() + 1; // number of keyframes
+  
+  Timer timer;
+  timer.Start();
+  
+  // Initialize gravity
+  {
+    const int n = 4;
+    Eigen::VectorXd x_(n);
+
+    // Build linear system
+    Eigen::MatrixXd A(3*(N-2), n);
+    Eigen::VectorXd b(3*(N-2));
+    for (unsigned i = 0; i < input.size()-1; ++i) {
+      const Eigen::Isometry3d &T1 = input[i].T1;   // camera to world
+      const Eigen::Isometry3d &T2 = input[i+1].T1; // camera to world
+      const Eigen::Isometry3d &T3 = input[i+1].T2; // camera to world
+      const IMU::Preintegrated &pInt12 = *(input[i].pInt);
+      const IMU::Preintegrated &pInt23 = *(input[i+1].pInt);
+
+      Eigen::Matrix3d R1 = T1.linear()*Tcb.linear(); // R1wb
+      Eigen::Matrix3d R2 = T2.linear()*Tcb.linear(); // R2wb
+      
+      Eigen::Matrix3d A_ = R1/pInt12.dT;
+      Eigen::Matrix3d B_ = R2/pInt23.dT;
+
+      // lambda:
+      // (p1_c - p2_c)/dt12 - (p2_c - p3_c)/dt23
+
+      // beta:
+      // - dt12/2 - dt23/2
+
+      // gamma:
+      // R1*dV12 - (R1*dP12 + R1_c*pcb - R2_c*pcb)/dt12 + (R2*dP23 + R2_c*pcb - R3_c*pcb)/dt23
+
+      // lambda_i
+      A.block<3, 1>(3*i, 0) = (T3.translation() - T2.translation())/pInt23.dT
+                               - (T2.translation() - T1.translation())/pInt12.dT;
+
+      // beta_i
+      A.block<3, 3>(3*i, 1) = -0.5*(pInt12.dT + pInt23.dT)*Eigen::Matrix3d::Identity();
+
+      // gamma_i
+      /*
+      b.segment<3>(3*i) = R1*pInt12.GetDeltaVelocity(bg, Eigen::Vector3d::Zero())
+                          - (R1*pInt12.GetDeltaPosition(bg, Eigen::Vector3d::Zero()) + T1.linear()*Tcb.translation() - T2.linear()*Tcb.translation())/pInt12.dT
+                          + (R2*pInt23.GetDeltaPosition(bg, Eigen::Vector3d::Zero()) + T2.linear()*Tcb.translation() - T3.linear()*Tcb.translation())/pInt23.dT;
+      */
+      b.segment<3>(3*i) = B_*pInt23.GetDeltaPosition(bg, Eigen::Vector3d::Zero()) - A_*pInt12.GetDeltaPosition(bg, Eigen::Vector3d::Zero())
+                           + R1*pInt12.GetDeltaVelocity(bg, Eigen::Vector3d::Zero())
+                           + (T2.linear() - T1.linear())*Tcb.translation()/pInt12.dT
+                           - (T3.linear() - T2.linear())*Tcb.translation()/pInt23.dT;
+    }
+
+    // Solution vector
+    x_ = pseudoInverse(A, 1e-6)*b;
+    
+    // Initial gravity solution
+    gravity = x_.tail<3>();
+  }
+
+  // Refine Gravity and Accelerometer Bias Estimation
+  // ------------------------------------------------
+
+  // R. Mur-Artal and J. D. Tardós, "Visual-Inertial Monocular SLAM With Map Reuse,"
+  //  in IEEE Robotics and Automation Letters, vol. 2, no. 2, pp. 796-803, April 2017,
+  //  doi: 10.1109/LRA.2017.2653359.
+
+  // Initialize Rwg estimate
+  Eigen::Vector3d dirG = gravity.tail<3>();
+  const Eigen::Vector3d gI = IMU::GRAVITY_VECTOR.normalized();
+  const Eigen::Vector3d v = gI.cross(dirG);
+  const double theta = std::atan2(v.norm(), gI.dot(dirG));
+  Eigen::Matrix3d Rwi = ExpSO3(v.normalized()*theta);
+
+  // Refinement
+  {
+    const int n = 6;
+    Eigen::VectorXd x_(n);
+
+    Eigen::MatrixXd A(3*(N-2), n);
+    Eigen::VectorXd b(3*(N-2));
+    for (unsigned i = 0; i < input.size()-1; ++i) {
+      const Eigen::Isometry3d &T1 = input[i].T1;   // camera to world
+      const Eigen::Isometry3d &T2 = input[i+1].T1; // camera to world
+      const Eigen::Isometry3d &T3 = input[i+1].T2; // camera to world
+      const IMU::Preintegrated &pInt12 = *(input[i].pInt);
+      const IMU::Preintegrated &pInt23 = *(input[i+1].pInt);
+
+      Eigen::Matrix3d R1 = T1.linear()*Tcb.linear(); // R1wb
+      Eigen::Matrix3d R2 = T2.linear()*Tcb.linear(); // R2wb
+      
+      Eigen::Matrix3d A_ = R1/pInt12.dT;
+      Eigen::Matrix3d B_ = R2/pInt23.dT;
+
+      // lambda:
+      // (p1_c - p2_c)/dt12 - (p2_c - p3_c)/dt23
+
+      // phi:
+      // G*Rwi*gI_x*(dt12/2 + dt23/2)
+
+      // xi:
+      // (R1*JPa12)/dt12 - R1*JVa12 - (R2*JPa23)/dt23
+
+      // psi:
+      // R1*dV12 - (R1*dP12 + R1_c*pcb - R2_c*pcb)/dt12 + (R2*dP23 + R2_c*pcb - R3_c*pcb)/dt23 + G*Rwi*gI*(dt12/2 + dt23/2)
+
+      // lambda_i
+      A.block<3, 1>(3*i, 0) = (T3.translation() - T2.translation())/pInt23.dT
+                               - (T2.translation() - T1.translation())/pInt12.dT;
+
+      // phi_i
+      A.block<3, 2>(3*i, 1) = 0.5*IMU::GRAVITY_MAGNITUDE*(pInt12.dT + pInt23.dT)
+                               *(Rwi*Skew(gI)).topLeftCorner<3, 2>();
+
+      // xi_i
+      A.block<3, 3>(3*i, 3) = A_*pInt12.JPa - B_*pInt23.JPa - R1*pInt12.JVa;
+
+      // psi_i
+      /*
+      b.segment<3>(3*i) = R1*pInt12.GetDeltaVelocity(bg, Eigen::Vector3d::Zero())
+                          - (R1*pInt12.GetDeltaPosition(bg, Eigen::Vector3d::Zero()) + T1.linear()*Tcb.translation() - T2.linear()*Tcb.translation())/pInt12.dT
+                          + (R2*pInt23.GetDeltaPosition(bg, Eigen::Vector3d::Zero()) + T2.linear()*Tcb.translation() - T3.linear()*Tcb.translation())/pInt23.dT
+                          + 0.5*IMU::GRAVITY_MAGNITUDE*Rwi*gI*(pInt12.dT + pInt23.dT);
+      */
+      b.segment<3>(3*i) = B_*pInt23.GetDeltaPosition(bg, Eigen::Vector3d::Zero()) - A_*pInt12.GetDeltaPosition(bg, Eigen::Vector3d::Zero())
+                           + R1*pInt12.GetDeltaVelocity(bg, Eigen::Vector3d::Zero())
+                           + (T2.linear() - T1.linear())*Tcb.translation()/pInt12.dT
+                           - (T3.linear() - T2.linear())*Tcb.translation()/pInt23.dT
+                           + 0.5*IMU::GRAVITY_MAGNITUDE*(pInt12.dT + pInt23.dT)*Rwi*gI;
+    }
+
+    // Solution vector
+    x_ = pseudoInverse(A, 1e-6)*b;
+    scale = x_(0);
+    ba = x_.tail<3>();
+    
+    // Refine gravity
+    Eigen::Vector3d dTheta;
+    dTheta.head<2>() = x_.segment<2>(1);
+    dTheta(2) = 0.;
+    
+    gravity = IMU::GRAVITY_MAGNITUDE*Rwi*(gI - Skew(gI)*dTheta);
+  }
+  
+  // The original paper proposes to use the algorithm below to compute scale and velocity.
+  // However, according to some benchmarking:
+  //  1. It has quadratic complexity
+  //  2. The scale factor is less accurate than Mur-Artal's method
+  // So we use the original Mur-Artal's formulation for evaluation (the accuracy of the velocities is not tested)
+  
+  Eigen::VectorXd velocities(3*N);
+  
+  timer.Start();
+  
+  // Recover velocities
+  for (unsigned int i = 0; i < input.size(); ++i) {
+    const Eigen::Isometry3d &T1 = input[i].T1;
+    const Eigen::Isometry3d &T2 = input[i].T2;
+    const IMU::Preintegrated &pInt12 = *(input[i].pInt);
+    
+    // -[(g*dt12^2)/2 + R1*dP12 + R1_c*pcb - R2_c*pcb + p1_c*s - p2_c*s]/dt12
+    velocities.segment<3>(3*i) = (-0.5*result.gravity*std::pow(pInt12.dT, 2)
+                                  - T1.linear()*Tcb.linear()*pInt12.GetDeltaPosition(bg, result.bias_a)
+                                  - (T1.linear() - T2.linear())*Tcb.translation()
+                                  - (T1.translation() - T2.translation())*result.scale)/pInt12.dT;
+  }
+  
+  // Lask keyframe velocity
+  {
+    const Eigen::Isometry3d &T1 = input.back().T2;
+    const IMU::Preintegrated &pInt12 = *(input.back().pInt);
+    
+    velocities.tail<3>() = velocities.segment<3>(3*(N-2)) + result.gravity*pInt12.dT
+                           + T1.linear()*Tcb.linear()*pInt12.GetDeltaVelocity(bg, result.bias_a);
+  }
+  
+  result.velocities_ns = timer.ElapsedNanoSeconds();
+
+  // Scale and Velocity Estimation
+  // -----------------------------
+
+  // T. Qin and S. Shen, "Robust initialization of monocular visual-inertial estimation on aerial robots,"
+  //  2017 IEEE/RSJ International Conference on Intelligent Robots and Systems (IROS), 2017, pp. 4225-4232,
+  //  doi: 10.1109/IROS.2017.8206284.
+
+/*
+  {
+    const int n = 3*(N+1) + 1;
+    Eigen::VectorXd x_(n);
+
+    // Since Huang et. al. doesn't say how the linear system should be solved, we use Qin and Shen approach,
+    // from VINS-Mono. Source code: https://github.com/HKUST-Aerial-Robotics/VINS-Mono
+    // File: vins_estimator/src/initial/initial_aligment.cpp
+    Eigen::MatrixXd A(n, n);
+    A.setZero();
+
+    Eigen::VectorXd b(n);
+    b.setZero();
+
+    for (unsigned i = 0; i < input.size(); ++i) {
+      const Eigen::Isometry3d &T1 = input[i].T1;   // camera to world
+      const Eigen::Isometry3d &T2 = input[i].T2;  // camera to world
+      const IMU::Preintegrated &pInt12 = *(input[i].pInt);
+
+      Eigen::Matrix3d R1 = T1.linear()*Tcb.linear(); // R1wb
+
+      // H:
+      // [ -dt12, 0, -dt12^2/2, p2_c - p1_c]
+      // [    -1, 1,     -dt12,           0]
+
+      // z:
+      //  R1*dP12 + R1_c*pcb - R2_c*pcb
+      //                        R1*dV12
+
+      Eigen::MatrixXd tmp_A(6, 10);
+      tmp_A.setZero();
+
+      tmp_A.block<3, 3>(0, 0) = -pInt12.dT*Eigen::Matrix3d::Identity();
+      tmp_A.block<3, 3>(0, 3).setZero();
+      tmp_A.block<3, 3>(0, 6) = -0.5*std::pow(pInt12.dT, 2)*Eigen::Matrix3d::Identity();
+      tmp_A.block<3, 1>(0, 9) = (T2.translation() - T1.translation()) / 100.0;
+
+      tmp_A.block<3, 3>(3, 0) = -Eigen::Matrix3d::Identity();
+      tmp_A.block<3, 3>(3, 3) = Eigen::Matrix3d::Identity();
+      tmp_A.block<3, 3>(3, 6) = -pInt12.dT*Eigen::Matrix3d::Identity();
+      tmp_A.block<3, 1>(3, 9).setZero();
+
+      Eigen::VectorXd tmp_b(6);
+      tmp_b.block<3, 1>(0, 0) = R1*pInt12.GetDeltaPosition(bg, ba) + (T1.linear() - T2.linear())*Tcb.translation();
+      tmp_b.block<3, 1>(3, 0) = R1*pInt12.GetDeltaVelocity(bg, ba);
+
+      Eigen::MatrixXd r_A = tmp_A.transpose()*tmp_A;
+      Eigen::VectorXd r_b = tmp_A.transpose()*tmp_b;
+
+      A.block<6, 6>(3*i, 3*i) += r_A.topLeftCorner<6, 6>();
+      A.bottomRightCorner<4, 4>() += r_A.bottomRightCorner<4, 4>();
+      A.block<6, 4>(3*i, n - 4) += r_A.topRightCorner<6, 4>();
+      A.block<4, 6>(n - 4, 3*i) += r_A.bottomLeftCorner<4, 6>();
+
+      b.segment<6>(3*i) += r_b.head<6>();
+      b.tail<4>() += r_b.tail<4>();
+    }
+
+    // Solution vector
+    A = A * 1000.0;
+    b = b * 1000.0;
+    x_ = A.ldlt().solve(b);
+    //scale = x_(n - 1) / 100.0;
+    //gravity = x_.segment<3>(n - 4);
+  }
+*/
+  
+  result.solve_ns = timer.ElapsedNanoSeconds();
+  
+  if (scale < 0.) {
+    result.success = false;
+    return;
+  }
+  
+  result.success = true;
+  result.scale = scale;
+  result.bias_a = ba;
+  result.gravity = gravity;
 }
 
 #endif // METHODS_H_

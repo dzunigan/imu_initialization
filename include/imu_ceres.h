@@ -80,11 +80,13 @@ bool GravityParameterization::ComputeJacobian(const double* x, double* jacobian)
 //      and invJr := InverseRightJacobianSO3(er)
 class GyroscopeBiasCostFunction : public ceres::SizedCostFunction<3, 3> {
  public:
-  GyroscopeBiasCostFunction(std::shared_ptr<const IMU::Preintegrated> pInt, const Eigen::Matrix3d& Ri, const Eigen::Matrix3d& Rj)
+  GyroscopeBiasCostFunction(std::shared_ptr<const IMU::Preintegrated> pInt, const Eigen::Matrix3d& Ri, const Eigen::Matrix3d& Rj, bool use_covarinace = true)
     : pInt(pInt), Ri(Ri), Rj(Rj)
   {
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(pInt->C.block<3, 3>(0, 0));
-    SqrtInformation = solver.operatorInverseSqrt();
+    if (use_covarinace) {
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(pInt->C.block<3, 3>(0, 0));
+      SqrtInformation = solver.operatorInverseSqrt();
+    } else SqrtInformation = Eigen::Matrix3d::Identity();
   }
   virtual ~GyroscopeBiasCostFunction() { }
 

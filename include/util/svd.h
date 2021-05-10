@@ -8,6 +8,8 @@
 #include <Eigen/Core>
 #include <Eigen/SVD>
 
+#include <Eigen/Eigenvalues>
+
 // https://eigen.tuxfamily.org/bz/show_bug.cgi?id=257#c24
 template<typename MatType>
 Eigen::Matrix<typename MatType::Scalar, MatType::ColsAtCompileTime, MatType::RowsAtCompileTime>

@@ -52,20 +52,20 @@ const double na = 2.e-3;
 Eigen::Isometry3d Tcb;
 
 struct evaluation_t {
-  evaluation_t(const std::uint64_t solve_time, const double initialization_time,
-               const std::uint64_t timestamp, const double scale_error,
-               const double gyro_bias_error, const double acc_bias_error, double gravity_error)
-    : solve_time(solve_time), initialization_time(initialization_time),
-      timestamp(timestamp), scale_error(scale_error),
-      gyro_bias_error(gyro_bias_error), acc_bias_error(acc_bias_error), gravity_error(gravity_error)
+  evaluation_t(const std::uint64_t execution_time,
+               const double scale_error, const double gyro_bias_error, const double gyro_bias_error2,
+               const double acc_bias_error, double acc_bias_error2, const double gravity_error)
+    : execution_time(execution_time),
+      scale_error(scale_error), gyro_bias_error(gyro_bias_error), gyro_bias_error2(gyro_bias_error2),
+      acc_bias_error(acc_bias_error), acc_bias_error2(acc_bias_error2), gravity_error(gravity_error)
   { }
 
-  std::uint64_t solve_time; // nanoseconds
-  double initialization_time; // seconds
-  std::uint64_t timestamp; // nanoseconds
+  std::uint64_t execution_time; // nanoseconds
   double scale_error; // percent
   double gyro_bias_error; // percent
+  double gyro_bias_error2; // degress
   double acc_bias_error; // percent
+  double acc_bias_error2; // degrees
   double gravity_error; // degrees
 };
 
@@ -227,12 +227,15 @@ Eigen::Isometry3d compute_scale(const InputType &input, const Groundtruth &groun
 }
 
 void save(const std::vector<evaluation_t> &data, const std::string &save_path) {
-  Eigen::MatrixXd m(data.size(), 7);
+  const int n = 7;
+
+  Eigen::MatrixXd m(data.size(), n);
 
   for (unsigned i = 0; i < data.size(); ++i) {
-    Eigen::RowVectorXd row(7);
-    row << data[i].solve_time, data[i].initialization_time, data[i].timestamp,
-           data[i].scale_error, data[i].gyro_bias_error, data[i].acc_bias_error, data[i].gravity_error;
+    Eigen::RowVectorXd row(n);
+    row << data[i].execution_time,
+           data[i].scale_error, data[i].gyro_bias_error, data[i].gyro_bias_error2,
+           data[i].acc_bias_error, data[i].acc_bias_error2, data[i].gravity_error;
     m.row(i) = row;
   }
 
@@ -267,12 +270,10 @@ void run(const fs::path &sequence_path) {
   LOG(INFO) << "Starting at " << static_cast<io::timestamp_t>(i->timestamp*1e9);
 
   std::vector<evaluation_t> proposed_evaluation;
+  std::vector<evaluation_t> proposed_noprior_evaluation;
   std::vector<evaluation_t> iterative_evaluation;
   std::vector<evaluation_t> iterative_noprior_evaluation;
-
-  unsigned count = 0;
-  std::uint64_t imu_integration = 0;
-  std::vector<double> imu_integration_times;
+  std::vector<evaluation_t> mqh_evaluation;
 
   double skipped = 0.;
   Trajectory::const_iterator i_ = i;
@@ -291,6 +292,8 @@ void run(const fs::path &sequence_path) {
 
     Eigen::Vector3d avgA;
     avgA.setZero();
+
+    std::uint64_t imu_preintegration = 0;
 
     io::ImuData::const_iterator it = imu_data.cbegin();
     for (unsigned n = 0; n < FLAGS_nframes; ++n) {
@@ -330,8 +333,7 @@ void run(const fs::path &sequence_path) {
       }
       //LOG(INFO) << "IMU stopped at " << it->timestamp;
 
-      imu_integration += timer.ElapsedNanoSeconds();
-      count++;
+      imu_preintegration += timer.ElapsedNanoSeconds();
 
       if (it == imu_data.cend()) {
         LOG(WARNING) << "IMU stream ended!";
@@ -357,12 +359,12 @@ void run(const fs::path &sequence_path) {
     const double avgA_error = std::abs(avgA.norm() - IMU::GRAVITY_MAGNITUDE) / IMU::GRAVITY_MAGNITUDE;
     //LOG(INFO) << "Average acceleration: " << 100.*avgA_error;
     if (avgA_error > 5e-3) {
-      LOG(INFO) << "Average preintegration time: " << imu_integration / count;
+      //LOG(INFO) << "Average preintegration time: " << imu_integration / count;
       //imu_integration = 0;
       //count = 0;
 
       std::uint64_t timestamp = input[0].t1;
-      double initialization_time = i->timestamp - i_->timestamp;
+      //double initialization_time = i->timestamp - i_->timestamp;
 
       double true_scale = std::numeric_limits<double>::quiet_NaN();
       Eigen::Isometry3d T = compute_scale(input, groundtruth, true_scale);
@@ -370,14 +372,14 @@ void run(const fs::path &sequence_path) {
 
       {
         ResultType gyroscope_result;
-        proposed_gyroscope(input, gyroscope_result, Tcb.linear());
+        gyroscope_only(input, gyroscope_result, Tcb.linear());
 
         ResultType accelerometer_result;
-        proposed_accelerometer(input, accelerometer_result, gyroscope_result.bias_g, Eigen::Vector3d::Zero(), Tcb);
+        analytic_accelerometer(input, accelerometer_result, gyroscope_result.bias_g, Eigen::Vector3d::Zero(), Tcb, 1e5);
 
         ResultType proposed_result;
         proposed_result.success = gyroscope_result.success & accelerometer_result.success;
-        proposed_result.solve_ns = gyroscope_result.solve_ns + accelerometer_result.solve_ns;
+        proposed_result.solve_ns = gyroscope_result.solve_ns + accelerometer_result.solve_ns + accelerometer_result.velocities_ns;
         proposed_result.scale = accelerometer_result.scale;
         proposed_result.bias_g = gyroscope_result.bias_g;
         proposed_result.bias_a = accelerometer_result.bias_a;
@@ -386,12 +388,42 @@ void run(const fs::path &sequence_path) {
         if (proposed_result.success) {
           const double scale_error = 100.*std::abs(proposed_result.scale - true_scale)/true_scale;
           const double gyro_bias_error = 100.*std::abs(proposed_result.bias_g.norm() - avgBg.norm()) / avgBg.norm();
+          const double gyro_bias_error2 = 180.*std::acos(proposed_result.bias_g.normalized().dot(avgBg.normalized()))/EIGEN_PI;
           const double acc_bias_error = 100.*std::abs(proposed_result.bias_a.norm() - avgBa.norm()) / avgBa.norm();
+          const double acc_bias_error2 = 180.*std::acos(proposed_result.bias_a.normalized().dot(avgBa.normalized()))/EIGEN_PI;
           const double gravity_error = 180.*std::acos((T.linear()*proposed_result.gravity).normalized().dot(IMU::GRAVITY_VECTOR.normalized()))/EIGEN_PI;
-          proposed_evaluation.emplace_back(proposed_result.solve_ns, initialization_time,
-                                           timestamp, scale_error, gyro_bias_error, acc_bias_error, gravity_error);
+          proposed_evaluation.emplace_back(imu_preintegration + proposed_result.solve_ns,
+              scale_error, gyro_bias_error, gyro_bias_error2, acc_bias_error, acc_bias_error2, gravity_error);
         } else
           LOG(ERROR) << "Proposed method failed at " << timestamp;
+      }
+
+      {
+        ResultType gyroscope_result;
+        gyroscope_only(input, gyroscope_result, Tcb.linear());
+
+        ResultType accelerometer_result;
+        analytic_accelerometer(input, accelerometer_result, gyroscope_result.bias_g, Eigen::Vector3d::Zero(), Tcb, 0.0);
+
+        ResultType proposed_result;
+        proposed_result.success = gyroscope_result.success & accelerometer_result.success;
+        proposed_result.solve_ns = gyroscope_result.solve_ns + accelerometer_result.solve_ns + accelerometer_result.velocities_ns;
+        proposed_result.scale = accelerometer_result.scale;
+        proposed_result.bias_g = gyroscope_result.bias_g;
+        proposed_result.bias_a = accelerometer_result.bias_a;
+        proposed_result.gravity = accelerometer_result.gravity;
+
+        if (proposed_result.success) {
+          const double scale_error = 100.*std::abs(proposed_result.scale - true_scale)/true_scale;
+          const double gyro_bias_error = 100.*std::abs(proposed_result.bias_g.norm() - avgBg.norm()) / avgBg.norm();
+          const double gyro_bias_error2 = 180.*std::acos(proposed_result.bias_g.normalized().dot(avgBg.normalized()))/EIGEN_PI;
+          const double acc_bias_error = 100.*std::abs(proposed_result.bias_a.norm() - avgBa.norm()) / avgBa.norm();
+          const double acc_bias_error2 = 180.*std::acos(proposed_result.bias_a.normalized().dot(avgBa.normalized()))/EIGEN_PI;
+          const double gravity_error = 180.*std::acos((T.linear()*proposed_result.gravity).normalized().dot(IMU::GRAVITY_VECTOR.normalized()))/EIGEN_PI;
+          proposed_noprior_evaluation.emplace_back(imu_preintegration + proposed_result.solve_ns,
+              scale_error, gyro_bias_error, gyro_bias_error2, acc_bias_error, acc_bias_error2, gravity_error);
+        } else
+          LOG(ERROR) << "Proposed w/o prior method failed at " << timestamp;
       }
 
       {
@@ -416,10 +448,12 @@ void run(const fs::path &sequence_path) {
         if (iterative_result.success) {
           const double scale_error = 100.*std::abs(iterative_result.scale - true_scale)/true_scale;
           const double gyro_bias_error = 100.*std::abs(iterative_result.bias_g.norm() - avgBg.norm()) / avgBg.norm();
+          const double gyro_bias_error2 = 180.*std::acos(iterative_result.bias_g.normalized().dot(avgBg.normalized()))/EIGEN_PI;
           const double acc_bias_error = 100.*std::abs(iterative_result.bias_a.norm() - avgBa.norm()) / avgBa.norm();
+          const double acc_bias_error2 = 180.*std::acos(iterative_result.bias_a.normalized().dot(avgBa.normalized()))/EIGEN_PI;
           const double gravity_error = 180.*std::acos((T.linear()*iterative_result.gravity).normalized().dot(IMU::GRAVITY_VECTOR.normalized()))/EIGEN_PI;
-          iterative_evaluation.emplace_back(iterative_result.solve_ns, initialization_time,
-                                            timestamp, scale_error, gyro_bias_error, acc_bias_error, gravity_error);
+          iterative_evaluation.emplace_back(imu_preintegration + iterative_result.solve_ns,
+              scale_error, gyro_bias_error, gyro_bias_error2, acc_bias_error, acc_bias_error2, gravity_error);
         } else
           LOG(ERROR) << "Iterative method failed at " << timestamp;
       }
@@ -434,7 +468,7 @@ void run(const fs::path &sequence_path) {
           double cost;
           ResultType result;
           //LOG(INFO) << "Initializing with scale " << scale;
-          iterative(input, result, scale, Tcb, &cost, false);
+          iterative(input, result, scale, Tcb, &cost, 0.0);
           max_solve_time = std::max(result.solve_ns, max_solve_time);
           if (cost < min_cost) {
             iterative_result = result;
@@ -446,12 +480,42 @@ void run(const fs::path &sequence_path) {
         if (iterative_result.success) {
           const double scale_error = 100.*std::abs(iterative_result.scale - true_scale)/true_scale;
           const double gyro_bias_error = 100.*std::abs(iterative_result.bias_g.norm() - avgBg.norm()) / avgBg.norm();
+          const double gyro_bias_error2 = 180.*std::acos(iterative_result.bias_g.normalized().dot(avgBg.normalized()))/EIGEN_PI;
           const double acc_bias_error = 100.*std::abs(iterative_result.bias_a.norm() - avgBa.norm()) / avgBa.norm();
+          const double acc_bias_error2 = 180.*std::acos(iterative_result.bias_a.normalized().dot(avgBa.normalized()))/EIGEN_PI;
           const double gravity_error = 180.*std::acos((T.linear()*iterative_result.gravity).normalized().dot(IMU::GRAVITY_VECTOR.normalized()))/EIGEN_PI;
-          iterative_noprior_evaluation.emplace_back(iterative_result.solve_ns, initialization_time,
-                                            timestamp, scale_error, gyro_bias_error, acc_bias_error, gravity_error);
+          iterative_noprior_evaluation.emplace_back(imu_preintegration + iterative_result.solve_ns,
+              scale_error, gyro_bias_error, gyro_bias_error2, acc_bias_error, acc_bias_error2, gravity_error);
         } else
           LOG(ERROR) << "Iterative w/o prior method failed at " << timestamp;
+      }
+
+      {
+        ResultType gyroscope_result;
+        gyroscope_only(input, gyroscope_result, Tcb.linear(), false);
+
+        ResultType accelerometer_result;
+        mqh_accelerometer(input, accelerometer_result, gyroscope_result.bias_g, Tcb);
+
+        ResultType mqh_result;
+        mqh_result.success = gyroscope_result.success & accelerometer_result.success;
+        mqh_result.solve_ns = gyroscope_result.solve_ns + accelerometer_result.solve_ns + accelerometer_result.velocities_ns;
+        mqh_result.scale = accelerometer_result.scale;
+        mqh_result.bias_g = gyroscope_result.bias_g;
+        mqh_result.bias_a = accelerometer_result.bias_a;
+        mqh_result.gravity = accelerometer_result.gravity;
+
+        if (mqh_result.success) {
+          const double scale_error = 100.*std::abs(mqh_result.scale - 1.);
+          const double gyro_bias_error = 100.*std::abs(mqh_result.bias_g.norm() - avgBg.norm()) / avgBg.norm();
+          const double gyro_bias_error2 = 180.*std::acos(mqh_result.bias_g.normalized().dot(avgBg.normalized()))/EIGEN_PI;
+          const double acc_bias_error = 100.*std::abs(mqh_result.bias_a.norm() - avgBa.norm()) / avgBa.norm();
+          const double acc_bias_error2 = 180.*std::acos(mqh_result.bias_a.normalized().dot(avgBa.normalized()))/EIGEN_PI;
+          const double gravity_error = 180.*std::acos(mqh_result.gravity.normalized().dot(IMU::GRAVITY_VECTOR.normalized()))/EIGEN_PI;
+          mqh_evaluation.emplace_back(imu_preintegration + mqh_result.solve_ns,
+              scale_error, gyro_bias_error, gyro_bias_error2, acc_bias_error, acc_bias_error2, gravity_error);
+        } else
+          LOG(ERROR) << "MQH method failed at " << timestamp;
       }
 
       i = next(i_, trajectory.cend(), 0.5);
@@ -463,12 +527,16 @@ void run(const fs::path &sequence_path) {
     }
   }
 
-  LOG(INFO) << StringPrintf("Average preintegration time: %.3f",
-                            1e-3 * static_cast<double>(imu_integration) / static_cast<double>(count));
+  //LOG(INFO) << StringPrintf("Average preintegration time: %.3f",
+  //                          1e-3 * static_cast<double>(imu_integration) / static_cast<double>(count));
 
   std::string proposed_file = sequence_name + "_ours.csv";
   LOG(INFO) << "Saving evaluation data into " << proposed_file;
   save(proposed_evaluation, proposed_file);
+
+  std::string proposed_noprior_file = sequence_name + "_ours_noprior.csv";
+  LOG(INFO) << "Saving evaluation data into " << proposed_noprior_file;
+  save(proposed_noprior_evaluation, proposed_noprior_file);
 
   std::string iterative_file = sequence_name + "_iterative.csv";
   LOG(INFO) << "Saving evaluation data into " << iterative_file;
@@ -477,6 +545,10 @@ void run(const fs::path &sequence_path) {
   std::string iterative_noprior_file = sequence_name + "_iterative_noprior.csv";
   LOG(INFO) << "Saving evaluation data into " << iterative_noprior_file;
   save(iterative_noprior_evaluation, iterative_noprior_file);
+
+  std::string mqh_file = sequence_name + "_mqh.csv";
+  LOG(INFO) << "Saving evaluation data into " << mqh_file;
+  save(mqh_evaluation, mqh_file);
 
   LOG(INFO) << "done." << std::endl;
 }

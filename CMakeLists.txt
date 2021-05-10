@@ -44,12 +44,6 @@ message(STATUS "Header files: " ${HEADER_FILES})
 add_executable(experiment01 src/experiment01.cc src/imu_preintegration.cc src/polynomial.cc src/so3.cc src/string.cc src/timer.cc)
 target_link_libraries(experiment01 ${Boost_LIBRARIES} ${CERES_LIBRARIES} ${GFLAGS_LIBRARY} ${GLOG_LIBRARIES})
 
-add_executable(experiment01a src/experiment01a.cc src/imu_preintegration.cc src/polynomial.cc src/so3.cc src/string.cc src/timer.cc)
-target_link_libraries(experiment01a ${Boost_LIBRARIES} ${CERES_LIBRARIES} ${GFLAGS_LIBRARY} ${GLOG_LIBRARIES})
-
-add_executable(experiment01b src/experiment01b.cc src/imu_preintegration.cc src/polynomial.cc src/so3.cc src/string.cc src/timer.cc)
-target_link_libraries(experiment01b ${Boost_LIBRARIES} ${CERES_LIBRARIES} ${GFLAGS_LIBRARY} ${GLOG_LIBRARIES})
-
 add_executable(experiment01c src/experiment01c.cc src/imu_preintegration.cc src/polynomial.cc src/so3.cc src/string.cc src/timer.cc)
 target_link_libraries(experiment01c ${Boost_LIBRARIES} ${CERES_LIBRARIES} ${GFLAGS_LIBRARY} ${GLOG_LIBRARIES})
 
